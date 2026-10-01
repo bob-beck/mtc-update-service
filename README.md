@@ -120,11 +120,14 @@ private enterprise arc. The demo uses `32473.7` (32473 is the IANA example
 PEN). Its first issuance log is log 1, so the log's ID is `32473.7.0.1`
 and its landmarks have IDs `32473.7.1.1.<L>`.
 
-The defaults are short so the whole lifecycle plays out in minutes: a
+The lifetimes are set short so the whole lifecycle plays out in minutes: a
 10 minute maximum certificate lifetime and a landmark every minute, which
-caps the active landmarks at 11 (Section 6.4.2).
+caps the active landmarks at 11 (Section 6.4.2). The CA issues with the
+IANA-assigned OIDs; without `--iana-oids` it uses the draft's experimental
+ones, and OpenSSL accepts either.
 
-    mtc ca -p ca new --log 1 --prefix-url http://localhost:8080 32473.7
+    mtc ca -p ca new --log 1 --prefix-url http://localhost:8080 \
+        --max-lifetime 10m --landmark-interval 1m --iana-oids 32473.7
 
 This writes `ca/ca-key.pem` (the CA cosigner's ML-DSA-44 key),
 `ca/ca-cert.pem` (an RFC 9925 unsigned certificate carrying the CA ID,
@@ -192,11 +195,15 @@ answers 202 with Retry-After until the next landmark mints, as the ACME
 `acme-optional-alternate` relation would), and rewrites that server's
 chain file with all of its unexpired certificates:
 
-    mtc-subscriber --ca-url http://localhost:8080 --out servers \
-        --server www:localhost:p256:1m
+    mtc-subscriber -ca-url http://localhost:8080 -out servers \
+        -server www:localhost:p256:1m
 
-The server spec is `name:dnsnames:keytype:interval`. This generates
-`servers/www/key.pem` once and keeps `servers/www/chains.pem` current. The
+The server spec is `name:dnsnames:keytype:interval`, with DNS names
+comma-separated and the key type `p256` or `mldsa44`; `-server` repeats
+for more servers. This generates `servers/www/key.pem` once and keeps
+`servers/www/chains.pem` current (its bookkeeping is in
+`servers/www/state.json` and the individual certificates under
+`servers/www/certs/`). The
 chain file is in the format `s_server -tai_chains` reads: for each
 certificate, a `CERTIFICATE PROPERTIES` block (TAI Section 7.4, carrying
 the trust anchor ID and the landmark group patterns of MTC Section
@@ -230,11 +237,15 @@ the vendor ships, the CA certificate, the cosigner certificate and a
 policy, and talks only to public endpoints. It is a tlog client, not a
 mirror: it signs nothing and keeps no copy of the log.
 
-    mtc-update-service --ca-cert ca/ca-cert.pem \
-        --cosigner-cert mirror/cosigner-cert.pem \
-        --mirror-url http://localhost:8081 \
-        --require-cosigner 32473.8 \
-        --interval 30s --out rp
+    mtc-update-service -ca-cert ca/ca-cert.pem \
+        -cosigner-cert mirror/cosigner-cert.pem -mirror-url http://localhost:8081 \
+        -interval 30s -out rp
+
+Every `-cosigner-cert` is a required cosigner, paired in order with a
+`-mirror-url` where that cosigner's cosigned checkpoint and tiles are
+read. The CA's own URL comes from its certificate (`-ca-url` overrides
+it), `-log` selects the issuance log (default 1), and `-max-active` caps
+the active landmarks accepted.
 
 Each run, for CA `32473.7` log 1:
 
@@ -252,8 +263,10 @@ Each run, for CA `32473.7` log 1:
    - `ca-cert.pem` and `cosigners.pem`, copied from the configured trust;
    - `landmarks-1.txt`, the CA's landmarks file as fetched;
    - `subtrees.txt`, one line `<CA ID> <log> <start> <end> <hash>` per
-     subtree whose proof verified. A subtree whose proof did not verify is
-     simply absent; the client then falls back to cosignatures for it.
+     subtree whose proof verified. A subtree that could not be vetted
+     this run keeps the line an earlier run gave it while its landmark is
+     active, and otherwise is simply absent; the client then falls back
+     to cosignatures for it.
 
 Run it with `--once` to do a single pass and exit.
 
@@ -308,8 +321,8 @@ Things to try
   and does not fall back: a hashed subtree that does not match is a hard
   failure (Section 7.2 step 11).
 - **Client authentication.** The same machinery works for client
-  certificates: add a `--server` spec with `--client` to the subscriber,
-  hand the chain file to `s_client -tai_chains`, and give `s_server`
+  certificates, once the subscriber grows a client-certificate option:
+  hand that chain file to `s_client -tai_chains`, and give `s_server`
   `-Verify 1 -mtc_cas` and the same landmark files.
 
 What this demo is not
