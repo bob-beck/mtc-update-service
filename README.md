@@ -2,16 +2,17 @@ Merkle Tree Certificates Update Service end-to-end demo
 =========================================
 
 This demo runs a sort of complete Merkle Tree Certificate (MTC)
-ecosystem on one machine: a CA with its issuance log, an independent
+ecosystem on one machine: a CA with its issuance log, an 'independent' (lol)
 cosigning mirror, a subscriber that keeps a TLS server supplied with
-certificates, a relying party update service that vets the CA's
+certificates which fakes out the role that would normally be done by ACME,
+, a relying party update service that vets the CA's
 landmarks for TLS clients, and an OpenSSL `s_server` and `s_client`
 that do the handshake. Every component talks to the others only over
-HTTP on localhost, or through files dropped in a directory, so each
-could equally run on its own host.
+HTTP on localhost, or through files dropped in a directory
 
-It follows draft-ietf-plants-merkle-tree-certs-06 (MTC) and
-draft-ietf-tls-trust-anchor-ids-05 (TAI).
+It currntly follows draft-ietf-plants-merkle-tree-certs-06 (MTC) and
+draft-ietf-tls-trust-anchor-ids-05 (TAI), other than it is using the
+IANA assigned oids by default.
 
 Pre warning of what this is NOT:
 --------------------------------
@@ -52,8 +53,10 @@ Two things that would exist in a real deployment are deliberately absent:
   ACME-to-server legs.
 - Distribution. Both the subscriber and the update service write their
   output into local directories. Getting those directories to a server or
-  a client host is left to rsync, an HTTPS fetcher, or whatever the
-  operator likes. In this demo everything reads them in place.
+  a client host would normally be done by something shipping an update
+  over the network or whatever. In this demo everything reads them in place.
+  If you want things running on other machines, rsync or http or whatever
+  them onto there.
 
 How the pieces fit
 ------------------
@@ -71,7 +74,7 @@ How the pieces fit
          |
          |  landmarks-1.txt, subtrees.txt, ca-cert.pem, cosigners.pem
          v
-    rp/32473.7/   - - - - - - - - - - - - - - - - - - - - - - - ->  s_client
+    rp/32473.1078/ - - - - - - - - - - - - - - - - - - - - - - ->  s_client
 
 Dashed arrows are "files in a directory"; solid arrows are HTTP.
 
@@ -79,10 +82,11 @@ The CA appends every certificate it issues to an append-only issuance
 log, signs a checkpoint and two subtrees covering the new entries, and
 pushes the log to the mirror, which checks it is append-only, stores a
 copy and cosigns. A *standalone* certificate carries an inclusion proof
-plus the CA's and the mirror's cosignatures (MTC Section 6.3). Every
-minute the CA designates the current tree size a *landmark*; entries
-below it get a *landmark-relative* certificate carrying only an inclusion
-proof and no signatures at all (Section 6.4).
+plus the CA's and the mirror's cosignatures (MTC Section 6.3).
+Periodically (every 5 seconds in the demo) the CA designates the current
+tree size a *landmark*; entries below it get a *landmark-relative*
+certificate carrying only an inclusion proof and no signatures at all
+(Section 6.4).
 
 A client can accept a landmark-relative certificate only if it already
 trusts the hash of the landmark subtree the proof leads to. That is what
@@ -97,233 +101,270 @@ signature anywhere in the certificate.
 Prerequisites
 -------------
 
-- Go 1.27 or later.
-- OpenSSL built from the `mtc-stack` branch of `~/openssl`, installed in
-  `~/ossl-master`. The commands below use `$OPENSSL` for its binary.
-- `~/cloudflare-mtc` and this repository checked out.
+- Go 1.27 or later, with the directory `go install` puts binaries in
+  on your `PATH`.
+- A C compiler, Perl and make, to build OpenSSL.
 
-    export OPENSSL=$HOME/ossl-master/bin/openssl
-    (cd ~/cloudflare-mtc && go build -o ~/bin/ ./cmd/...)
-    (cd ~/mtc-update-service && go build -o ~/bin/ ./cmd/...)
-    mkdir -p ~/mtc-demo && cd ~/mtc-demo
+Make one directory to hold everything in the demo, and do everything
+below from inside it. The three repositories are cloned into it, the
+demo's OpenSSL is installed into it, and the demo runs in it; nothing is
+written anywhere else.
 
-All remaining commands run from `~/mtc-demo`. Each long-running component
-gets its own terminal.
+    mkdir <somewhere> && cd <somewhere>
+    git clone https://github.com/openssl/openssl.git
+    git clone https://github.com/bob-beck/cloudflare-mtc.git
+    git clone https://github.com/bob-beck/mtc-update-service.git
 
-Ports used: CA 8080, mirror 8081, TLS server 4433.
+The Merkle Tree Certificate and trust anchor identifier support for
+OpenSSL is pull request [#33014](https://github.com/openssl/openssl/pull/33014).
+Fetch it into a branch, build it, and install it into `openssl-install`
+under the top-level directory. The demo scripts take the install
+directory from the `OPENSSL` environment variable if it is set, and
+otherwise use this one, `../openssl-install` from the demo directory.
 
-Step 1: the CA
---------------
+    (cd openssl && git fetch origin pull/33014/head:mtc-stack && git checkout mtc-stack)
+    (cd openssl && ./Configure --prefix="$PWD/../openssl-install" && make -j8 && make install_sw)
+    export OPENSSL="$PWD/openssl-install"
 
-The CA is identified by a trust anchor ID, a relative OID under the IANA
-private enterprise arc. The demo uses `32473.7` (32473 is the IANA example
-PEN). Its first issuance log is log 1, so the log's ID is `32473.7.0.1`
-and its landmarks have IDs `32473.7.1.1.<L>`.
+Build and install the Go programs, `mtc`, `mtc-subscriber` and
+`mtc-update-service`:
 
-The lifetimes are set short so the whole lifecycle plays out in minutes: a
-10 minute maximum certificate lifetime and a landmark every minute, which
-caps the active landmarks at 11 (Section 6.4.2). The CA issues with the
-IANA-assigned OIDs; without `--iana-oids` it uses the draft's experimental
-ones, and OpenSSL accepts either.
+    (cd cloudflare-mtc && go install ./cmd/...)
+    (cd mtc-update-service && go install ./cmd/...)
 
-    mtc ca -p ca new --log 1 --prefix-url http://localhost:8080 \
-        --max-lifetime 10m --landmark-interval 1m --iana-oids 32473.7
+Check that everything is found:
 
-This writes `ca/ca-key.pem` (the CA cosigner's ML-DSA-44 key),
-`ca/ca-cert.pem` (an RFC 9925 unsigned certificate carrying the CA ID,
-the cosigner key, the critical MTC CA extension and the mtc-tlog prefix
-URL) and `ca/www/`, the directory served at the prefix URL.
+    $OPENSSL/bin/openssl version
+    which mtc mtc-subscriber mtc-update-service
 
-Do not start it yet; the mirror has to exist first.
+Ports used: CA 8080, mirror 8081, TLS server 4433, all on localhost.
 
-Step 2: the mirror
-------------------
+Running the demo
+----------------
 
-The mirror is a second, independent cosigner. It has its own ID,
-`32473.8`, and its own ML-DSA-44 key. It never issues anything: it follows
-the CA's log, verifies every push is append-only, keeps a full copy, and
-cosigns checkpoints and subtrees.
+Three scripts in `mtc-update-service/demo/`, each in its own terminal,
+all run from a `demo` subdirectory of the top-level directory. Everything
+they create lives under it.
 
-    mtc mirror -p mirror new 32473.8
-    mtc mirror -p mirror add-log --log 1 ca/ca-cert.pem
-    mtc mirror -p mirror serve --listen localhost:8081
+Terminal 1, the infrastructure. On first run this creates the CA
+(`32473.1078`) and the mirror (`32473.1079`), then starts the mirror, the
+CA, the subscriber and the update service, logging each to `logs/`, and
+tails the two interesting logs. Interrupting it stops them all. Run again, it
+reuses the CA and mirror already there.
 
-`mirror/cosigner-cert.pem` is the mirror's cosigner certificate; relying
-parties that require the mirror's cosignature are configured with it.
+    mkdir demo && cd demo
+    sh ../mtc-update-service/demo/run.sh
 
-Back in the CA, register the mirror as a required cosigner, so that
-issuance fails rather than produce certificates the mirror has not seen:
+Terminal 2, the server. `s_server` serves one connection, exits, and is
+started again with the subscriber's current chain file.
 
-    mtc ca -p ca add-mirror --required http://localhost:8081 mirror/cosigner-cert.pem
+    cd demo
+    sh ../mtc-update-service/demo/demo-server.sh
 
-Step 3: start the CA
---------------------
+Terminal 3, the client. One `s_client` connection every 10 seconds with
+the update service's current files, summarised to a few lines.
 
-    mtc ca -p ca serve --listen localhost:8080 --issue-every 10s
+    cd demo
+    sh ../mtc-update-service/demo/demo-client.sh
 
-The CA now serves its log at `http://localhost:8080/1/` (checkpoint,
-tiles, landmarks) and runs an issuance job every 10 seconds: it appends
-queued requests, signs a checkpoint and the covering subtrees, pushes to
-the mirror and collects its cosignatures, writes certificates, and
-allocates a landmark when a minute has passed since the last one.
+The OpenSSL commands have to be restarted to see updated files; both
+`s_server` and `s_client` read their files once at startup. That is why
+the two scripts loop. A real server or client would reload.
 
-Useful things to look at while it runs:
+What you will see
+-----------------
 
-    curl -s http://localhost:8080/1/checkpoint
-    curl -s http://localhost:8080/1/landmarks
-    curl -s http://localhost:8081/$(printf 'oid/1.3.6.1.4.1.32473.7.0.1' | shasum -a 256 | cut -c1-64)/checkpoint
+The timings are shortened so a certificate's whole life passes in a
+minute, and the two sides update at very different rates:
 
-The CA's checkpoint carries one signature line (the CA cosigner); the
-mirror's copy carries two.
+| | |
+|---|---|
+| Certificate lifetime | 1 minute |
+| CA issuance run | every 1 second |
+| Landmark allocated | every 5 seconds |
+| Server gets a new certificate | every 5 seconds (one per landmark) |
+| Client's landmark files refreshed | every 45 seconds |
+| Client connects | every 10 seconds |
+| Server key | ML-DSA-44 |
 
-Step 4: the subscriber
-----------------------
+Everything in the handshake that can be post-quantum is: the server's
+key, the CA cosigner and the mirror cosigner are all ML-DSA-44, and the
+key exchange is X25519MLKEM768. A landmark-relative certificate carries
+no signature at all, which is the size saving the design is for.
 
-An MTC server does not hold one certificate that it renews. It requests
-a new one at a regular interval, much shorter than the lifetime, and
-keeps serving *every* certificate it holds for as long as each is valid.
-Each landmark-relative certificate is pinned to the landmark that first
-covered its entry, so a server that has been reissued every minute holds
-one for every active landmark. A client whose landmark state is a few
-minutes stale can still be served a signatureless certificate for a
-landmark it knows.
+So the server is always current, holding about a dozen live
+certificates, one per active landmark, while the client learns about
+landmarks only once per certificate lifetime and is usually several
+landmarks behind the server.
 
-The subscriber does this on the server's behalf. For each configured
-server it posts a request to the CA on its interval, polls for the
-standalone certificate and then for the landmark-relative one (the CA
-answers 202 with Retry-After until the next landmark mints, as the ACME
-`acme-optional-alternate` relation would), and rewrites that server's
-chain file with all of its unexpired certificates:
+**Terminal 1** tails `logs/subscriber.log` and `logs/update-service.log`.
 
-    mtc-subscriber -ca-url http://localhost:8080 -out servers \
-        -server www:localhost:p256:1m
+The subscriber logs each request and what came back for it:
 
-The server spec is `name:dnsnames:keytype:interval`, with DNS names
-comma-separated and the key type `p256` or `mldsa44`; `-server` repeats
-for more servers. This generates `servers/www/key.pem` once and keeps
-`servers/www/chains.pem` current (its bookkeeping is in
-`servers/www/state.json` and the individual certificates under
-`servers/www/certs/`). The
-chain file is in the format `s_server -tai_chains` reads: for each
-certificate, a `CERTIFICATE PROPERTIES` block (TAI Section 7.4, carrying
-the trust anchor ID and the landmark group patterns of MTC Section
-8.2.1), the certificate, and the private key; landmark-relative
-certificates first, since Section 8.2 says to prefer them, standalone
-certificates last as the fallback. Expired certificates drop out on the
-next rewrite.
+    13:08:16 www: requested 01790881696605083000-e07eabf146af1119
+    13:08:17 www: 01790881696605083000-e07eabf146af1119: standalone certificate 12, expires 2026-10-01T19:09:17Z
+    13:08:21 www: 01790881696605083000-e07eabf146af1119: landmark-relative certificate 12
 
-Step 5: the TLS server
-----------------------
+The number is the entry's index in the issuance log. The standalone
+certificate appears within a second of the request (the CA's next
+issuance run); the landmark-relative one appears when the next landmark
+is allocated, up to 5 seconds later. Both go into `servers/www/chains.pem`
+and stay there until they expire a minute later.
 
-    $OPENSSL s_server -accept 4433 -tls1_3 -www \
-        -cert fallback.pem -key fallback-key.pem \
-        -tai_chains servers/www/chains.pem
+The update service logs one line per run:
 
-`fallback.pem` is any ordinary certificate, for clients that do not send
-`trust_anchors` at all:
+    13:08:46 32473.1078 log 1: reference size 31; vetted 10:[16,24) 10:[24,30) 11:[30,31) ...; unvetted none
 
-    $OPENSSL req -x509 -newkey ed25519 -nodes -subj /CN=fallback -days 30 \
-        -keyout fallback-key.pem -out fallback.pem
+`reference size` is the tree size of the mirror's cosigned checkpoint
+that everything was proved against. Each `L:[a,b)` is a landmark number
+and one of its subtrees, now proved consistent with that checkpoint and
+written to `rp/32473.1078/subtrees.txt`. `unvetted` lists active
+landmarks that could not be proved this run, normally because they are
+newer than what the mirror has cosigned yet; they get picked up next
+run. Before the CA's first landmark exists the service logs an error
+fetching the landmarks file; it clears on the next run.
 
-`s_server` reads the chain file once at startup. To pick up the certs the
-subscriber has added since, restart it. (A production server reloads;
-this is a demo limitation, not a protocol one.)
+**Terminal 2** prints two lines per connection:
 
-Step 6: the update service
---------------------------
+    13:09:00 listening on 4433 with 23 certificates from servers/www/chains.pem
+    13:09:04 served connection 7; restarting with the current chain file
 
-This is the component a client vendor would run. It trusts exactly what
-the vendor ships, the CA certificate, the cosigner certificate and a
-policy, and talks only to public endpoints. It is a tlog client, not a
-mirror: it signs nothing and keeps no copy of the log.
+The certificate count is what that `s_server` loaded: roughly two per
+live entry (standalone plus landmark-relative), so about two dozen at
+steady state. `s_server`'s own output is in `logs/server.log`.
 
-    mtc-update-service -ca-cert ca/ca-cert.pem \
-        -cosigner-cert mirror/cosigner-cert.pem -mirror-url http://localhost:8081 \
-        -interval 30s -out rp
+**Terminal 3** prints three lines per connection:
 
-Every `-cosigner-cert` is a required cosigner, paired in order with a
-`-mirror-url` where that cosigner's cosigned checkpoint and tiles are
-read. The CA's own URL comes from its certificate (`-ca-url` overrides
-it), `-log` selects the issuance log (default 1), and `-max-active` caps
-the active landmarks accepted.
+    13:09:04 client has landmarks up to 23, 14 vetted subtrees
+    13:09:04 verify: 0 (ok); serial 0x100000000001a (log 1, index 26); subtree [26, 27); landmark-relative
+    13:09:04 next connection in 10s
 
-Each run, for CA `32473.7` log 1:
+The first line is the client's state from its last update: the newest
+landmark number in its landmarks file and how many subtree hashes it
+trusts. The second is the result: the verify return code, then a
+description of the certificate the server chose, from `mtc inspect`:
+its serial (log number and entry index), the subtree its inclusion proof
+leads to, and either `landmark-relative` (no signatures at all) or the
+number of cosignatures it carries; then the certificate's key type as
+`s_client` reports it.
 
-1. Fetches `/1/landmarks` from the CA, checks it is well formed (Section
-   6.4.3). The file is an unsigned CA claim; the vetting is what follows.
-2. Fetches the mirror's cosigned checkpoint and verifies both signature
-   lines against the shipped certificates. If the mirror has not yet
-   cosigned a tree at least as large as the latest landmark, the newest
-   landmarks are not vetted this run.
-3. For each active landmark, derives its two subtrees (Section 6.4.1),
-   computes their hashes from tiles fetched from the mirror, and verifies
-   a subtree consistency proof against the cosigned checkpoint (Section
-   4.4.3).
-4. Writes `rp/32473.7/`:
-   - `ca-cert.pem` and `cosigners.pem`, copied from the configured trust;
-   - `landmarks-1.txt`, the CA's landmarks file as fetched;
-   - `subtrees.txt`, one line `<CA ID> <log> <start> <end> <hash>` per
-     subtree whose proof verified. A subtree that could not be vetted
-     this run keeps the line an earlier run gave it while its landmark is
-     active, and otherwise is simply absent; the client then falls back
-     to cosignatures for it.
+What to notice:
 
-Run it with `--once` to do a single pass and exit.
-
-Step 7: the TLS client
-----------------------
-
-    $OPENSSL s_client -connect localhost:4433 -tls1_3 \
-        -no-CAfile -no-CApath -no-CAstore \
-        -mtc_cas rp/32473.7/ca-cert.pem \
-        -mtc_cosigners rp/32473.7/cosigners.pem -mtc_cosigner_quorum 1 \
-        -mtc_landmarks 32473.7:1:rp/32473.7/landmarks-1.txt \
-        -mtc_subtrees rp/32473.7/subtrees.txt \
-        -showcerts -tlsextdebug </dev/null
-
-Expect `Verify return code: 0 (ok)` and, in the `-tlsextdebug` output, the
-client's `trust_anchors` extension carrying the landmark group
-`32473.7.2.1.<L>` for the newest landmark it holds a hash for. The
-certificate the server sent is landmark-relative; confirm it has no
-signatures:
-
-    $OPENSSL s_client -connect localhost:4433 -tls1_3 \
-        -no-CAfile -no-CApath -no-CAstore \
-        -mtc_cas rp/32473.7/ca-cert.pem \
-        -mtc_landmarks 32473.7:1:rp/32473.7/landmarks-1.txt \
-        -mtc_subtrees rp/32473.7/subtrees.txt </dev/null 2>/dev/null \
-      | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
-      | mtc inspect cert /dev/stdin
-
-`mtc inspect` prints the MTCProof: the subtree bounds, the inclusion
-proof hashes, and an empty signature list.
+- `verify: 0 (ok)` with `landmark-relative` is the point of the
+  exercise: a certificate with no signature anywhere, accepted because
+  the client trusts the hash of subtree `[26, 27)` from its update.
+- The index in the served certificate lags the server's newest. The
+  client advertises the landmark group for the newest landmark *it*
+  knows (TAI `trust_anchors`, MTC Section 8.2.1), and the server picks a
+  landmark-relative certificate pinned to a landmark at or below that.
+  The server has newer ones, but this client cannot verify them yet.
+- Between refreshes of the client's files the client is served the same
+  certificate every time. When the files are refreshed, the `landmarks
+  up to` number increases and the client requests the newer certificate,
+  which the server then continues to serve it until the client's files
+  are refreshed with another new landmark.
 
 Things to try
 -------------
 
-- **Stale client.** Stop the update service, wait a few minutes, connect
-  again. The client still advertises its last vetted landmark group, the
-  server still holds a landmark-relative certificate for one of those
-  landmarks, and the handshake stays signatureless. After ten minutes
-  every landmark the client knows has expired and the client drops back
-  to advertising the bare CA ID; the server answers with a standalone
-  certificate and verification uses the cosignatures instead.
-- **Client with no landmarks.** Leave out `-mtc_landmarks` and
-  `-mtc_subtrees`. The client advertises `32473.7`, gets a standalone
-  certificate, and verification requires the CA's cosignature plus the
-  mirror's (`-mtc_cosigner_quorum 1`).
-- **Mirror lags.** Stop the mirror. Issuance stops (the mirror is
-  required), so no new landmarks appear either. Restart it and watch the
-  CA catch it up; the update service picks up the newly covered landmarks
-  on its next run.
-- **Untrusted hash.** Edit one hash in `rp/32473.7/subtrees.txt` and
-  connect. The client fails verification for that landmark's certificate
-  and does not fall back: a hashed subtree that does not match is a hard
-  failure (Section 7.2 step 11).
-- **Client authentication.** The same machinery works for client
-  certificates, once the subscriber grows a client-certificate option:
-  hand that chain file to `s_client -tai_chains`, and give `s_server`
-  `-Verify 1 -mtc_cas` and the same landmark files.
+The infrastructure script takes its timings from the environment; the CA
+ones (`LIFETIME`, `LANDMARK_INTERVAL`) are baked into the CA at creation,
+so changing those needs a fresh directory. `KEY_TYPE=p256` gives the
+server an EC key instead of ML-DSA-44; the subscriber keeps the key it
+generated, so changing that needs `servers/` removed.
+
+- **A client that falls back.** Refresh the client less often than a
+  certificate lives:
+
+      UPDATE_INTERVAL=2m sh ../mtc-update-service/demo/run.sh
+
+  For the first minute after each update the client is served
+  landmark-relative certificates as before. Then every landmark it knows
+  has expired, its advertised group matches nothing the server holds,
+  and terminal 3 shows `2 signature(s)`: the server fell back to a
+  standalone certificate and the client verified the CA's and the
+  mirror's cosignatures instead. Verification still says `0 (ok)`.
+- **A client with no landmark state at all.** Point the client script at
+  a directory containing only `ca-cert.pem` and `cosigners.pem`, or run
+  `s_client` by hand without `-mtc_landmarks` and `-mtc_subtrees`. Every
+  connection gets a standalone certificate with two signatures.
+- **The mirror as the gate.** Kill the `mtc mirror` process. Issuance
+  stops, because the mirror is a required cosigner. The update service
+  keeps vetting against the last checkpoint the mirror did cosign.
+- **A hash the vendor got wrong.** Edit one hash in
+  `rp/32473.1078/subtrees.txt`. The next connection that lands on that
+  landmark's certificate fails verification outright; a trusted subtree
+  whose hash does not match is a hard failure, not a fallback (MTC
+  Section 7.2 step 11). The update service overwrites the file on its
+  next run.
+
+Running the pieces by hand
+--------------------------
+
+`run.sh` is only these commands. They are what you would run on separate
+machines, with the localhost URLs replaced.
+
+Create the CA and mirror once. The CA issues with the IANA-assigned OIDs;
+without `--iana-oids` it uses the draft's experimental ones, and OpenSSL
+accepts either.
+
+    mtc ca -p ca new --log 1 --prefix-url http://localhost:8080 \
+        --max-lifetime 1m --landmark-interval 5s --iana-oids 32473.1078
+    mtc mirror -p mirror new 32473.1079
+    mtc mirror -p mirror add-log --log 1 ca/ca-cert.pem
+
+Start the mirror, register it with the CA as a required cosigner, start
+the CA:
+
+    mtc mirror -p mirror serve --listen localhost:8081
+    mtc ca -p ca add-mirror --required http://localhost:8081 mirror/cosigner-cert.pem
+    mtc ca -p ca serve --listen localhost:8080 --issue-every 1s
+
+The subscriber, for one server named `www` with DNS name `localhost`, an
+ML-DSA-44 key, reissued every 5 seconds (`-server` repeats for more
+servers; the key type can also be `p256`):
+
+    mtc-subscriber -ca-url http://localhost:8080 -out servers -tick 1s \
+        -server www:localhost:mldsa44:5s
+
+It keeps `servers/www/chains.pem` in the form `s_server -tai_chains`
+reads: for each certificate a `CERTIFICATE PROPERTIES` block (TAI Section
+7.4), the certificate and the private key, landmark-relative certificates
+first, standalone last as the fallback, expired ones dropped.
+
+The update service, trusting the CA certificate and requiring the
+mirror's cosignature (each `-cosigner-cert` pairs with the `-mirror-url`
+in the same position):
+
+    mtc-update-service -ca-cert ca/ca-cert.pem \
+        -cosigner-cert mirror/cosigner-cert.pem -mirror-url http://localhost:8081 \
+        -interval 45s -out rp
+
+It writes `rp/32473.1078/`: `ca-cert.pem` and `cosigners.pem` as given,
+`landmarks-1.txt` as fetched from the CA, and `subtrees.txt` with one
+line per vetted subtree in the form `-mtc_subtrees` reads. `-once` does a
+single pass; `-max-active` caps the landmarks accepted.
+
+The server and client commands the two scripts loop over:
+
+    $OPENSSL/bin/openssl s_server -accept 4433 -tls1_3 -www -naccept 1 \
+        -cert fallback.pem -key fallback-key.pem \
+        -tai_chains servers/www/chains.pem
+
+    $OPENSSL/bin/openssl s_client -connect localhost:4433 -tls1_3 \
+        -no-CAfile -no-CApath -no-CAstore \
+        -mtc_cas rp/32473.1078/ca-cert.pem \
+        -mtc_cosigners rp/32473.1078/cosigners.pem -mtc_cosigner_quorum 1 \
+        -mtc_landmarks 32473.1078:1:rp/32473.1078/landmarks-1.txt \
+        -mtc_subtrees rp/32473.1078/subtrees.txt \
+        -showcerts </dev/null
+
+`fallback.pem` is any ordinary certificate, for clients that send no
+`trust_anchors` at all; the server script makes one.
+
+Adding `-tlsextdebug` to the `s_client` command shows the TLS extensions
+on the wire, including the `trust anchors` extension in which the server
+lists every trust anchor ID it can serve.
 
 What this demo is not
 ---------------------
