@@ -3,10 +3,15 @@
 # update service's current output, one summary line per connection. Each
 # run is a fresh s_client, since it reads its files once at startup.
 #
-# Usage: cd <demo dir> && sh /path/to/demo-client.sh [rp dir] [port] [interval seconds]
+# Usage: cd <demo dir> && sh /path/to/demo-client.sh [both]
+# With no argument each round connects to the www virtual host; with any
+# argument each round connects to www and then api.
 # OPENSSL is the install directory of an openssl built from the mtc-stack
 # branch; unset, the demo layout's ../openssl-install is used. mtc (from
 # cloudflare-mtc) is used to describe the certificate received.
+#   RP        the update service's output directory (default rp/32473.1078)
+#   PORT      the server's port (default 4433)
+#   INTERVAL  seconds between rounds (default 10)
 
 set -eu
 
@@ -19,9 +24,14 @@ if ! "$OPENSSL/bin/openssl" s_client -help 2>&1 | grep -q -- -mtc_cas; then
 	echo "$OPENSSL/bin/openssl has no Merkle Tree Certificate support; it must be built from the mtc-stack branch" >&2
 	exit 1
 fi
-RP=${1:-rp/32473.1078}
-PORT=${2:-4433}
-INTERVAL=${3:-10}
+RP=${RP:-rp/32473.1078}
+PORT=${PORT:-4433}
+INTERVAL=${INTERVAL:-10}
+if [ $# -gt 0 ]; then
+	SERVERS="www api"
+else
+	SERVERS="www"
+fi
 CA_ID=$(basename "$RP")
 LAST=${TMPDIR:-/tmp}/demo-client-cert.$$.pem
 trap 'rm -f "$LAST"' EXIT
@@ -31,8 +41,8 @@ while [ ! -f "$RP/subtrees.txt" ]; do
 	sleep 5
 done
 
-while :; do
-	out=$("$OPENSSL/bin/openssl" s_client -connect "localhost:$PORT" -tls1_3 \
+connect() {
+	out=$("$OPENSSL/bin/openssl" s_client -connect "localhost:$PORT" -servername "$1" -tls1_3 \
 		-no-CAfile -no-CApath -no-CAstore \
 		-mtc_cas "$RP/ca-cert.pem" \
 		-mtc_cosigners "$RP/cosigners.pem" -mtc_cosigner_quorum 1 \
@@ -51,10 +61,16 @@ while :; do
 			     END {if (s == "") exit; if (g == "") g = n " signature(s)"; print s "; " t "; " g}')
 		result="verify: $verify; ${cert:-no certificate}; key ${key:-unknown}"
 	fi
+	echo "$(date +%H:%M:%S) $1: $result"
+}
+
+while :; do
 	latest=$(head -1 "$RP/landmarks-1.txt" 2>/dev/null)
 	vetted=$(grep -vc '^#' "$RP/subtrees.txt" 2>/dev/null || echo 0)
 	echo "$(date +%H:%M:%S) client has landmarks up to $latest, $vetted vetted subtrees"
-	echo "$(date +%H:%M:%S) $result"
+	for s in $SERVERS; do
+		connect "$s"
+	done
 	echo "$(date +%H:%M:%S) next connection in ${INTERVAL}s"
 	sleep "$INTERVAL"
 done

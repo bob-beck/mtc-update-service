@@ -64,7 +64,8 @@ PIDS="$PIDS $!"
 wait_port $CA_PORT
 
 mtc-subscriber -ca-url http://localhost:$CA_PORT -out servers -tick 1s \
-	-server www:localhost:$KEY_TYPE:$REISSUE_INTERVAL >logs/subscriber.log 2>&1 &
+	-server www:localhost:$KEY_TYPE:$REISSUE_INTERVAL \
+	-server api:api:$KEY_TYPE:$REISSUE_INTERVAL >logs/subscriber.log 2>&1 &
 PIDS="$PIDS $!"
 
 mtc-update-service -ca-cert ca/ca-cert.pem \

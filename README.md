@@ -123,8 +123,13 @@ directory from the `OPENSSL` environment variable if it is set, and
 otherwise use this one, `../openssl-install` from the demo directory.
 
     (cd openssl && git fetch origin pull/33014/head:mtc-stack && git checkout mtc-stack)
-    (cd openssl && ./Configure --prefix="$PWD/../openssl-install" && make -j8 && make install_sw)
+    (cd openssl && ./Configure --prefix="$PWD/../openssl-install" --libdir=lib \
+        "-Wl,-rpath,$PWD/../openssl-install/lib" && make -j8 && make install_sw)
     export OPENSSL="$PWD/openssl-install"
+
+The rpath lets the installed `openssl`, and the web servers built against
+it below, find this OpenSSL's shared libraries without any environment
+variable.
 
 Build and install the Go programs, `mtc`, `mtc-subscriber` and
 `mtc-update-service`:
@@ -366,7 +371,100 @@ Adding `-tlsextdebug` to the `s_client` command shows the TLS extensions
 on the wire, including the `trust anchors` extension in which the server
 lists every trust anchor ID it can serve.
 
-What this demo is not
+Using a real web server
+-----------------------
+
+The server side of the demo can be a real web server in place of
+`s_server`: nginx, Apache httpd or HAProxy, each from a fork with support
+for serving certificate chains selected by trust anchor identifier, and
+each serving two virtual hosts, `www` and `api`, from their own chain
+files. The rest of the demo is unchanged; the subscriber already keeps
+both `servers/www/chains.pem` and `servers/api/chains.pem` current, and
+the client script takes the name of the virtual host to ask for.
+
+Each server is built against the OpenSSL installed in `openssl-install`
+and runs from a configuration written inside the demo directory. Make
+sure you have whatever that server needs to build in the first place;
+only the parts specific to this demo are given here.
+
+The forks are cloned into the top-level directory next to the others.
+httpd also needs the APR and APR-util source trees in its `srclib/`:
+
+    git clone https://github.com/bob-beck/nginx.git
+    git clone https://github.com/bob-beck/apache-httpd.git
+    git clone -b 1.7.x https://github.com/apache/apr.git apache-httpd/srclib/apr
+    git clone -b 1.7.x https://github.com/apache/apr-util.git apache-httpd/srclib/apr-util
+    git clone https://github.com/bob-beck/haproxy.git
+
+**nginx** (`ssl_tai_certificate`, `ssl_tai_certificate_key`,
+`ssl_tai_certificate_preference`). Point `auto/configure` at the demo
+OpenSSL; it reports `checking for OpenSSL trust anchor identifiers ...
+found`. The binary is `nginx/objs/nginx`; nothing is installed.
+
+    cd nginx
+    ./auto/configure --with-http_ssl_module \
+        --with-cc-opt="-I$PWD/../openssl-install/include" \
+        --with-ld-opt="-L$PWD/../openssl-install/lib -Wl,-rpath,$PWD/../openssl-install/lib"
+    make -j8
+    cd ..
+
+**Apache httpd** (`SSLTAICertificateFile`, `SSLTAICertificateKeyFile`,
+`SSLTAICertificatePreference`). A fresh clone has no `configure`;
+httpd's `buildconf` generates it. Then configure with `--with-ssl`
+pointing at the demo OpenSSL and install into `httpd-install` under the
+top-level directory; configure reports `checking for
+SSL_CTX_add1_credential... yes`.
+
+    cd apache-httpd
+    ./buildconf
+    ./configure --prefix="$PWD/../httpd-install" --with-included-apr --enable-ssl \
+        --with-ssl="$PWD/../openssl-install" --enable-mods-shared=ssl \
+        LDFLAGS="-Wl,-rpath,$PWD/../openssl-install/lib"
+    make -j8
+    make install
+    cd ..
+
+**HAProxy** (`tai-chains`, `tai-keys`, `tai-preference` on `bind` and in
+crt-lists). Build with `USE_TAI=1` and the demo OpenSSL; `haproxy -vv`
+then lists `+TAI` and `Built with SSL library version : OpenSSL
+4.2.0-dev`. The binary is `haproxy/haproxy`; nothing is installed.
+
+    cd haproxy
+    make -j8 TARGET=generic USE_OPENSSL=1 USE_TAI=1 \
+        SSL_INC="$PWD/../openssl-install/include" SSL_LIB="$PWD/../openssl-install/lib" \
+        ADDLIB="-Wl,-rpath,$PWD/../openssl-install/lib"
+    cd ..
+
+Then, with `run.sh` running in terminal 1 as before, run the chosen
+server in terminal 2 in place of `demo-server.sh`:
+
+    cd demo
+    sh ../mtc-update-service/demo/demo-webserver.sh nginx
+
+or `httpd` or `haproxy`. The script writes the server's configuration
+under `demo/nginx/`, `demo/httpd/` or `demo/haproxy/`, starts the server
+on port 4433, and reloads it whenever either chain file changes,
+printing a line each time. The server keeps running between
+connections; this is a server that reloads its certificates, which is
+what `s_server` could not do. The server binaries are found relative to
+the demo directory as laid out above; `NGINX_BIN`, `HAPROXY_BIN` and
+`HTTPD_DIR` (the httpd install directory) override that.
+
+In terminal 3 start the client but give it an argument 'both', and it
+will connect to both virtual hosts each round, `www` and then `api`:
+
+    sh ../mtc-update-service/demo/demo-client.sh both
+
+Each virtual host serves certificates from its own chain file and lists
+only its own trust anchor IDs; a client that sends no trust anchors at
+all is served the ordinary fallback certificate.
+
+Only one server can hold port 4433 at a time; stop `demo-server.sh` or
+one web server before starting another. If it doesn't die cleanly
+because the shell code sucks for your machine or whatever, hunting
+it down and killing manually is an exercise for the reader. 
+
+REMINDER: What this demo is not
 ---------------------
 
 - NOT THE WAY TO WRITE A CA - please do not use this code, it's a hack

@@ -80,11 +80,11 @@ func ParseLandmarks(data []byte, now time.Time) ([]Landmark, error) {
 	if err != nil || latest > MaxLogEntries {
 		return nil, fmt.Errorf("landmarks: bad latest landmark %q", lines[0])
 	}
+	if uint64(len(lines)-1) > latest {
+		return nil, errors.New("landmarks: more lines than landmarks")
+	}
 	var out []Landmark
 	for i, line := range lines[1:] {
-		if uint64(i) > latest {
-			return nil, errors.New("landmarks: more lines than landmarks")
-		}
 		sizeText, expiryText, ok := strings.Cut(line, " ")
 		if !ok {
 			return nil, fmt.Errorf("landmarks: malformed line %q", line)
@@ -105,9 +105,6 @@ func ParseLandmarks(data []byte, now time.Time) ([]Landmark, error) {
 		}
 		out = append(out, l)
 		if !l.Active(now) {
-			if i != len(lines)-2 {
-				return nil, errors.New("landmarks: lines after the expired landmark")
-			}
 			return out, nil
 		}
 	}

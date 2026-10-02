@@ -79,12 +79,19 @@ func TestParseLandmarks(t *testing.T) {
 	if len(ls) != 3 || ls[0] != (Landmark{3, 30, 1200}) || ls[2] != (Landmark{1, 10, 900}) || ls[2].Active(now) || !ls[1].Active(now) {
 		t.Error(ls)
 	}
+	// Lines after the first expired landmark are not read.
+	ls, err = ParseLandmarks([]byte("3\n30 1200\n20 900\n10 900\n"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ls) != 2 || ls[1] != (Landmark{2, 20, 900}) {
+		t.Error(ls)
+	}
 	for _, bad := range []string{
 		"3\n30 1200\n20 1100\n",         // no expired landmark
 		"3\n30 1200\n20 1100\n10 900",   // no final newline
 		"3\n30 1200\n40 1100\n10 900\n", // sizes not decreasing
 		"3\n30 1200\n20 1300\n10 900\n", // expiries increase
-		"3\n30 1200\n20 900\n10 900\n",  // lines after the expired one
 		"1\n30 1200\n20 1100\n10 900\n", // more lines than landmarks
 		"3\n30 1200\n020 1100\n10 900\n",
 	} {

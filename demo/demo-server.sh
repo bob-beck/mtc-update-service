@@ -23,8 +23,11 @@ CHAINS=${1:-servers/www/chains.pem}
 PORT=${2:-4433}
 
 if [ ! -f fallback.pem ]; then
-	"$OPENSSL/bin/openssl" req -x509 -newkey ed25519 -nodes -subj /CN=fallback -days 30 \
-		-keyout fallback-key.pem -out fallback.pem 2>/dev/null
+	if ! "$OPENSSL/bin/openssl" req -x509 -newkey ed25519 -nodes -subj /CN=fallback -days 30 -config /dev/null \
+		-keyout fallback-key.pem -out fallback.pem; then
+		echo "making fallback.pem with $OPENSSL/bin/openssl failed" >&2
+		exit 1
+	fi
 fi
 while [ ! -f "$CHAINS" ]; do
 	echo "waiting for $CHAINS"
